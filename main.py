@@ -12,12 +12,12 @@ app = FastAPI()
 os.makedirs("temp_media", exist_ok=True)
 app.mount("/media", StaticFiles(directory="temp_media"), name="media")
 
-IG_USER_ID = os.getenv("IG_USER_ID", "17841438360187312")
-ACCESS_TOKEN = os.getenv(
-    "ACCESS_TOKEN",
-    "EAApvtNhyUiABS5h5XwgxQmXjZCN1v5R1hOY4sG2m1EZAZC5ZBaQMPTrkDBXPXMr8CfBb7z5cfnsYZCQqmcZBuk9Vt5N7VIbePeg2iTfrPUZBrmXZC1hzPEYqZBVkbK2FmQDZCu9YNuwMZAzTE0BbwhdS6XcxIbLyEIiM3am71GfOK2ZB1XbSXZBZBFnybsOfbfx5ZBPXQKYoo0nDZBZAALjxTd2ii31Ul91Xj7NsSng09vhJz",
+# Секреты теперь берутся ТОЛЬКО из настроек окружения сервера (Environment Variables)
+IG_USER_ID = os.getenv("IG_USER_ID", "")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
+BASE_URL = os.getenv(
+    "RENDER_EXTERNAL_URL", "https://instagram-poster-orrp.onrender.com"
 )
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 
 class PostPayload(BaseModel):
@@ -83,36 +83,70 @@ def create_quote_card(text: str, output_path: str):
   img.save(output_path, "JPEG", quality=95)
 
 
+def wait_for_media(container_id: str, max_retries: int = 12):
+  """Ждет, пока сервер Meta обработает фото/карусель перед публикацией."""
+  for _ in range(max_retries):
+    try:
+      res = requests.get(
+          f"https://graph.facebook.com/v26.0/{container_id}",
+          params={"fields": "status_code", "access_token": ACCESS_TOKEN},
+          timeout=15,
+      ).json()
+      status = res.get("status_code")
+      print(f"Container {container_id} status: {status}", flush=True)
+      if status == "FINISHED":
+        return True
+      if status == "ERROR":
+        print(f"Container {container_id} failed: {res}", flush=True)
+        return False
+    except Exception as e:
+      print(f"Status check error: {e}", flush=True)
+    time.sleep(5)
+  return True
+
+
 def publish_task(payload: PostPayload):
+  if not IG_USER_ID or not ACCESS_TOKEN:
+    print("ERROR: IG_USER_ID or ACCESS_TOKEN is not set in Environment!", flush=True)
+    return
+
   local_files = []
   try:
     public_urls = []
     base_endpoint = BASE_URL.rstrip("/")
+    ts = int(time.time())
 
     if not payload.photos and payload.text.strip():
-      filename = f"quote_{int(time.time())}.jpg"
+      filename = f"quote_{ts}.jpg"
       filepath = os.path.join("temp_media", filename)
       create_quote_card(payload.text, filepath)
       local_files.append(filepath)
       public_urls.append(f"{base_endpoint}/media/{filename}")
     else:
+      headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
       for idx, url in enumerate(payload.photos[:10]):
-        temp_raw = f"temp_media/raw_{int(time.time())}_{idx}.jpg"
-        temp_out = f"temp_media/ready_{int(time.time())}_{idx}.jpg"
+        temp_raw = f"temp_media/raw_{ts}_{idx}.jpg"
+        temp_out = f"temp_media/ready_{ts}_{idx}.jpg"
 
-        r = requests.get(url, timeout=30)
-        with open(temp_raw, "wb") as f:
-          f.write(r.content)
+        try:
+          r = requests.get(url, headers=headers, timeout=30)
+          r.raise_for_status()
+          with open(temp_raw, "wb") as f:
+            f.write(r.content)
 
-        pad_image_for_instagram(temp_raw, temp_out)
-        if os.path.exists(temp_raw):
-          os.remove(temp_raw)
-
-        local_files.append(temp_out)
-        fname = os.path.basename(temp_out)
-        public_urls.append(f"{base_endpoint}/media/{fname}")
+          pad_image_for_instagram(temp_raw, temp_out)
+          local_files.append(temp_out)
+          fname = os.path.basename(temp_out)
+          public_urls.append(f"{base_endpoint}/media/{fname}")
+          print(f"Photo {idx} processed OK: {fname}", flush=True)
+        except Exception as e:
+          print(f"Error processing photo {idx}: {e}", flush=True)
+        finally:
+          if os.path.exists(temp_raw):
+            os.remove(temp_raw)
 
     if not public_urls:
+      print("No valid photos to publish. Aborting.", flush=True)
       return
 
     caption = payload.text[:2100]
@@ -125,7 +159,9 @@ def publish_task(payload: PostPayload):
               "caption": caption,
               "access_token": ACCESS_TOKEN,
           },
+          timeout=30,
       ).json()
+      print("Single media response:", res, flush=True)
       creation_id = res.get("id")
     else:
       child_ids = []
@@ -137,9 +173,16 @@ def publish_task(payload: PostPayload):
                 "is_carousel_item": "true",
                 "access_token": ACCESS_TOKEN,
             },
+            timeout=30,
         ).json()
+        print("Child container response:", c_res, flush=True)
         if "id" in c_res:
           child_ids.append(c_res["id"])
+          wait_for_media(c_res["id"])
+
+      if not child_ids:
+        print("No child containers created. Aborting.", flush=True)
+        return
 
       res = requests.post(
           f"https://graph.facebook.com/v26.0/{IG_USER_ID}/media",
@@ -149,15 +192,21 @@ def publish_task(payload: PostPayload):
               "children": ",".join(child_ids),
               "access_token": ACCESS_TOKEN,
           },
+          timeout=30,
       ).json()
+      print("Carousel container response:", res, flush=True)
       creation_id = res.get("id")
 
     if creation_id:
-      time.sleep(6)
-      requests.post(
+      wait_for_media(creation_id)
+      pub_res = requests.post(
           f"https://graph.facebook.com/v26.0/{IG_USER_ID}/media_publish",
           data={"creation_id": creation_id, "access_token": ACCESS_TOKEN},
-      )
+          timeout=30,
+      ).json()
+      print("Final publish response:", pub_res, flush=True)
+      # Пауза перед удалением файлов, чтобы сервера Meta успели всё докачать
+      time.sleep(15)
   finally:
     for f in local_files:
       if os.path.exists(f):
